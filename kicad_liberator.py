@@ -181,9 +181,10 @@ def identify_used_symbols_and_footprints(sch_file):
     return symbols, footprints
 
 
-def identify_used_footprints_and_models(brd_file):
+def gather_footprints_and_identify_models(brd_file):
     """
-    Returns a list of used footprints and 3D models in a pcb file
+    Gathers footprint definitions from the PCB file and identifies 3D models
+    used by them.
     """
 
     # Load the PCB
@@ -194,7 +195,7 @@ def identify_used_footprints_and_models(brd_file):
     assert root.keyword == "kicad_pcb"
 
     # Look for modules and models
-    footprints = set()
+    footprints = {}
     models = set()
 
     for node in root.children:
@@ -210,10 +211,9 @@ def identify_used_footprints_and_models(brd_file):
             lib = None
             name = footprint
 
-        footprints.add(Footprint(
-            name = name,
-            lib = lib
-            ))
+        # Store
+        footprint = Footprint(name = name, lib = lib)
+        footprints[footprint] = node
 
         # Look for "model"
         for item in node.children:
@@ -240,7 +240,6 @@ def identify_used_models(footprints, footprint_libs):
 
         # Library used in project but not found.
         if footprint.lib not in libs_by_name:
-            print("WARNING: Library '{}' not found!".format(footprint.lib))
             continue
 
         lib_file = libs_by_name[footprint.lib]
@@ -248,7 +247,6 @@ def identify_used_models(footprints, footprint_libs):
 
         # Footprint not found in the library
         if not os.path.isfile(src_file):
-            print("WARNING: Footrpint '{}' not found in '{}'".format(footprint.name, footprint.lib))
             continue
 
         # Load the footprint
@@ -359,8 +357,8 @@ def collect_symbols(symbols, symbol_libs):
     for lib, lib_symbols in symbols_by_lib.items():
 
         # Library used in project but not found.
-        if lib not in libs_by_name:
-            print("ERROR: Library '{}' not found!".format(lib))
+        if lib not in libs_by_name or not os.path.isfile(libs_by_name[lib]):
+            print(" ERROR: Library '{}' for symbols '{}' not found!".format(lib, ",".join(lib_symbols)))
             continue
 
         # Load the library content
@@ -374,7 +372,7 @@ def collect_symbols(symbols, symbol_libs):
             # Grab
             data = grab_symbol(lib_data, name)
             if data is None:
-                print("ERROR: Symbol '{}' not found in '{}'".format(name, lib))
+                print(" ERROR: Symbol '{}' not found in '{}'".format(name, lib))
                 continue
  
             # Add to definition
@@ -424,7 +422,69 @@ def process_symbol_defs(symbol_defs, symbol_map):
 # =============================================================================
 
 
-def collect_footprints(footprints, footprint_libs):
+def preprocess_pcb_footprints(footprints):
+    """
+    Processes footprints extracted from PCB to make them generic and to be
+    placed in the new library
+    """
+
+    # A helper function for processing element rotations
+    def cancel_rotation(node, rotation):
+
+        # Skip those. The "model" element seems to have rotation relative to
+        # the footprint.
+        if node.keyword in ["at", "model"]:
+            return
+
+        # We have the "at" child
+        at = node.find("at")
+        if at is not None:
+
+            # Get its rotation
+            coords = at.attributes
+            rot = 0.0 if len(coords) < 3 else float(coords[2])
+
+            # Cancel it
+            rot -= rotation
+            rot  = "{:.3f}".format(rot)
+
+            # Replace the "at" node
+            new_at = bracket_tree.Node(node, "at", [coords[0], coords[1], rot])
+            node.replace(at, new_at)
+
+        # Recurse
+        for child in node.children:
+            cancel_rotation(child, rotation)
+
+    # Process footprints
+    for footprint, root in footprints.items():
+
+        # Remove the "at" node, get the footprint rotation.
+        node = root.find("at")
+        if node is not None:
+            coords = node.attributes
+            rotation = 0.0 if len(coords) < 3 else float(coords[2])
+            root.remove(node)
+        else:
+            rotation = 0.0
+
+        # Cancel rotation of all elements of the footprint
+        for node in root.children:
+            cancel_rotation(node, rotation)
+
+        # Texts
+        for node in root.findall("fp_text"):
+
+            if node.attributes[0] == "reference":
+                node.replace(node.attributes[1], "REF**")
+
+            if node.attributes[0] == "value":
+                node.replace(node.attributes[1], footprint.name)
+
+    return footprints
+
+
+def collect_footprints_from_libraries(footprints, footprint_libs):
     """
     Collects footprint definition files from multiple libraries.
     """
@@ -438,7 +498,8 @@ def collect_footprints(footprints, footprint_libs):
 
         # Library used in project but not found.
         if footprint.lib not in libs_by_name:
-            print("ERROR: Library '{}' not found!".format(footprint.lib))
+            print(" ERROR: Library '{}' for footprint '{}' not found!".format(footprint.lib, footprint.name))
+            footprint_defs[footprint] = None
             continue
 
         lib_file = libs_by_name[footprint.lib]
@@ -446,7 +507,8 @@ def collect_footprints(footprints, footprint_libs):
 
         # Footprint not found in the library
         if not os.path.isfile(src_file):
-            print("ERROR: Footrpint '{}' not found in '{}'".format(footprint.name, footprint.lib))
+            print(" ERROR: Footrpint '{}' not found in '{}'".format(footprint.name, footprint.lib))
+            footprint_defs[footprint] = None
             continue
 
         # Load the footprint
@@ -476,6 +538,10 @@ def process_footprints(footprint_defs, footprint_map, model_map, path):
 
     # Process footprint data
     for footprint, root in footprint_defs.items():
+
+        if root is None:
+            continue
+
         new_name = footprint_map[footprint].name
         dst_file = os.path.join(path, new_name + ".kicad_mod")
 
@@ -493,7 +559,7 @@ def process_footprints(footprint_defs, footprint_map, model_map, path):
 
         # Check for duplicates
         if dst_file in written_files:
-            print("ERROR: Duplcate footprint '{}'".format(new_name))
+            print(" ERROR: Duplcate footprint '{}'".format(new_name))
             continue
 
         # Write the footrpint
@@ -521,12 +587,12 @@ def collect_models(models, path):
 
         # Model file not found
         if not os.path.isfile(src_file):
-            print("ERROR: Model '{}' not found".format(model))
+            print(" ERROR: Model '{}' not found".format(model))
             continue
 
         # Check for duplicates
         if dst_file in written_files:
-            print("ERROR: Duplcate model '{}'".format(os.path.basename(model)))
+            print(" ERROR: Duplcate model '{}'".format(os.path.basename(model)))
             continue
 
         # Copy the file
@@ -715,29 +781,34 @@ def main():
     # Identify used symbols and footprints
     print("Identifying used schematic symbols and footrpints...")
 
-    symbols = set()
-    footprints = set()
-    models = set()
+    lib_symbols = set()
+    lib_footprints = set()
+    lib_models = set()
+    pcb_footprints = {}
+    pcb_models = set()
 
     for f in proj["sch"]:
         sch_file = os.path.join(inp_path, f)
 
         syms, fps = identify_used_symbols_and_footprints(sch_file)
-        symbols    |= syms
-        footprints |= fps
+        lib_symbols    |= syms
+        lib_footprints |= fps
 
     # Identify used footprints and 3d models
     print("Identifying used PCB footprints and 3D models...")
 
     for f in proj["brd"]:
         brd_file = os.path.join(inp_path, f)
-        fps, mdls = identify_used_footprints_and_models(brd_file)
-        footprints |= fps
-        models     |= mdls
+        fps, mdls = gather_footprints_and_identify_models(brd_file)
+        pcb_footprints.update(fps)
+        pcb_models |= mdls
 
     # Identify 3D models used by footprint libraries
-    models |= identify_used_models(footprints, footprint_libs)
+    lib_models |= identify_used_models(lib_footprints, footprint_libs)
 
+    # Preprocess PCB footprints
+    pcb_footprints = preprocess_pcb_footprints(pcb_footprints)
+   
     # .....................................................
 
     # Build symbol map
@@ -751,7 +822,7 @@ def main():
 
     # FIXME: This will fail if there are two symbols with the same name in
     # different libraries but one of them has an ALIAS.
-    for symbol in symbols:
+    for symbol in lib_symbols:
         new_name  = symbol.name
         suffix_id = 0
 
@@ -767,6 +838,8 @@ def main():
         used_names.add(new_name)
 
     # Build footprint map
+    all_footprints = set(lib_footprints | set(pcb_footprints.keys()))
+
     footprint_lib = Library(
         name=proj_name,
         filename="footprints.pretty"
@@ -775,7 +848,7 @@ def main():
     footprint_map = {}
     used_names = set()
 
-    for footprint in footprints:
+    for footprint in all_footprints:
         new_name  = footprint.name
         suffix_id = 0
 
@@ -791,12 +864,13 @@ def main():
         used_names.add(new_name)
 
     # Build 3d model map
-    model_lib = os.path.join("${KIPRJMOD}", "models")
+    all_models = lib_models | pcb_models
+    model_lib  = os.path.join("${KIPRJMOD}", "models")
 
     model_map = {}
     used_names = set()
 
-    for model in models:
+    for model in all_models:
         name = os.path.basename(model)
         new_name = name
         suffix = 0
@@ -822,10 +896,10 @@ def main():
 
     # Collect symbols
     print("Collecting schematic symbols from libraries...")
-    symbol_defs = collect_symbols(symbols, symbol_libs)
+    lib_symbols = collect_symbols(lib_symbols, symbol_libs)
 
     # Remap names in symbol defs
-    symbol_defs = process_symbol_defs(symbol_defs, symbol_map)
+    lib_symbols = process_symbol_defs(lib_symbols, symbol_map)
 
     # Write the new symbol library
     lib_data = [
@@ -833,7 +907,7 @@ def main():
         "#encoding utf-8",
     ]
 
-    for symbol_def in symbol_defs.values():
+    for symbol_def in lib_symbols.values():
         lib_data.extend(symbol_def)
 
     lib_data.extend([
@@ -861,12 +935,25 @@ def main():
 
     # .....................................................
 
-    # Collect footprints
+    # Collect footprints from footprint libraries
     print("Collecting PCB footprints from libraries...")
-    footprint_defs = collect_footprints(footprints, footprint_libs)
+    lib_footprints = collect_footprints_from_libraries(lib_footprints, footprint_libs)
+
+    # For missing footprints, take their definitions directly from the PCB
+    for footprint in lib_footprints:
+
+        if lib_footprints[footprint] is not None:
+            continue
+
+        if footprint not in pcb_footprints:
+            print(" ERROR: Footprint '{}' not found in PCB(s)!".format(footprint.name))
+            continue
+
+        print(" Extracting '{}' from PCB".format(footprint.name))
+        lib_footprints[footprint] = pcb_footprints[footprint]
 
     # Write footprints to the new library
-    process_footprints(footprint_defs, footprint_map, model_map,
+    process_footprints(lib_footprints, footprint_map, model_map,
                        os.path.join(out_path, footprint_lib.filename))
 
     # Write fp-lib-table
@@ -885,12 +972,12 @@ def main():
     # .....................................................
 
     # Substitute environmental variables in model names
-    models = [substitute_env_vars(m, kicad_env_vars) for m in models]
+    all_models = [substitute_env_vars(m, kicad_env_vars) for m in all_models]
     model_lib = substitute_env_vars(model_lib, {"KIPRJMOD": out_path})
 
     # Collect 3d models
     print("Collecting 3D models from libraries...")
-    collect_models(models, model_lib)
+    collect_models(all_models, model_lib)
 
     # .....................................................
 

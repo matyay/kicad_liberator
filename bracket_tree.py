@@ -41,6 +41,22 @@ class Node(object):
         """
         self.child.append(child)
 
+    def remove(self, child):
+        """
+        Removes a child
+        """
+        assert child in self.child
+        self.child.remove(child)
+
+    def replace(self, child, new_child):
+        """
+        Replaces a child
+        """
+        assert child in self.child
+
+        idx = self.child.index(child)
+        self.child[idx] = new_child
+
     def findall(self, keyword):
         """
         Finds all child nodes with given keyword. Returns a list of them.
